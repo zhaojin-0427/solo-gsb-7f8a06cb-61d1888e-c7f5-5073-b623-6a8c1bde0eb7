@@ -739,4 +739,178 @@ const lcSkip = runSimLC([
 assert.deepStrictEqual(lcSkip[0].events, []);
 assert.strictEqual(lcSkip[1].clock, lcSkip[0].clock + 1000);
 
+// --- 服务端同名取值分析（nameReads / nameAnalysis）---
+
+// 场景：同名不同路径共存 → 同名组；覆盖把末项改成同值 → 分歧消失；再删除 → 同名组消失
+const stepsNA = [
+  { seconds: 0, url: 'https://example.com/', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['sid=a; Path=/', 'sid=b; Path=/x', 'uniq=1; Path=/'] },
+  { seconds: 1, url: 'https://example.com/x', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['sid=a; Path=/x'] }, // 覆盖 /x 的项为同值 a
+  { seconds: 1, url: 'https://example.com/x', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: [] }, // 同名但取值一致
+  { seconds: 1, url: 'https://example.com/x', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['sid=; Path=/; Max-Age=0', 'sid=; Path=/x; Max-Age=0'] },
+  { seconds: 1, url: 'https://example.com/x', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] }
+];
+const naRun = runSimLC(stepsNA);
+const naR = naRun.results;
+
+// 第 1 步：空头无同名组（nameReads 为空数组；跳过步才是 null）
+assert.ok(naR[0].request && Array.isArray(naR[0].nameReads) && naR[0].nameReads.length === 0);
+
+// 第 2 步：头顺序 = 路径更长的 /x 在前；首 b 末 a，分歧
+const g2 = naR[1].nameReads;
+assert.strictEqual(g2.length, 1);
+assert.strictEqual(g2[0].name, 'sid');
+assert.deepStrictEqual(g2[0].items.map((x) => x.value), ['b', 'a']);
+assert.deepStrictEqual(g2[0].items.map((x) => x.path), ['/x', '/']);
+assert.strictEqual(g2[0].firstValue, 'b');
+assert.strictEqual(g2[0].lastValue, 'a');
+assert.strictEqual(g2[0].divergent, true);
+// 逐项携带域、路径、创建次序
+assert.strictEqual(g2[0].items[0].creationOrder, 1, '创建次序为 Jar 单调序（0 基）');
+assert.strictEqual(g2[0].items[1].creationOrder, 0);
+assert.strictEqual(g2[0].items[0].domain, 'example.com');
+
+// 第 3 步：同名一致，不分歧
+assert.strictEqual(naR[2].nameReads.length, 1);
+assert.strictEqual(naR[2].nameReads[0].divergent, false);
+assert.strictEqual(naR[2].nameReads[0].firstValue, 'a');
+
+// 第 4 步：删除响应在发送之后处理，本步头里仍是 sid=a 同名组（取值一致，不分歧）
+assert.strictEqual(naR[3].nameReads.length, 1);
+assert.strictEqual(naR[3].nameReads[0].divergent, false);
+assert.deepStrictEqual(naR[3].nameReads[0].items.map((x) => x.value), ['a', 'a']);
+// 第 5 步：两项均已删除，无同名组
+assert.strictEqual(naR[4].nameReads.length, 0);
+
+// 全局时间线：有效请求 5 个；只有 sid 一个同名名称；分歧仅第 2 步
+const na = naRun.nameAnalysis;
+assert.strictEqual(na.validStepCount, 5);
+assert.deepStrictEqual(na.duplicateNames, ['sid']);
+assert.deepStrictEqual(na.divergentNames, ['sid']);
+const tSid = na.timeline[0];
+assert.strictEqual(tSid.name, 'sid');
+assert.deepStrictEqual(tSid.states.map((s) => s.state), ['absent', 'divergent', 'same', 'same', 'absent']);
+assert.strictEqual(tSid.divergences.length, 1);
+const d1 = tSid.divergences[0];
+assert.strictEqual(d1.fromStep, 1);
+assert.strictEqual(d1.toStep, 1);
+assert.strictEqual(d1.riseKind, 'appeared-divergent');
+assert.strictEqual(d1.fallKind, 'resolved');
+assert.strictEqual(d1.ongoing, false);
+
+// 产生窗口：第 1 步响应中的两条写入（本步响应不纳入）
+{
+  const rise = d1.riseEvents;
+  assert.strictEqual(rise.length, 2, '两条同名写入都关联到产生窗口');
+  assert.ok(rise.every((e) => e.step === 0 && e.phase === 'response' && e.type === 'stored'));
+  assert.ok(rise.every((e) => e.member), '两条都命中分歧同名组中的具体项');
+  assert.deepStrictEqual(rise.map((e) => e.path), ['/', '/x']);
+}
+// 消失窗口：第 2 步的覆盖响应（先发送后处理，影响第 3 步）
+{
+  const fall = d1.fallEvents;
+  assert.strictEqual(fall.length, 1);
+  assert.strictEqual(fall[0].step, 1);
+  assert.strictEqual(fall[0].type, 'updated');
+  assert.strictEqual(fall[0].phase, 'response');
+  assert.strictEqual(fall[0].path, '/x');
+  assert.strictEqual(fall[0].member, true);
+  assert.strictEqual(fall[0].beforeValue, 'b');
+  assert.strictEqual(fall[0].afterValue, 'a');
+}
+
+// 场景：同名组按名称区分大小写（Jar 键本身名称不区分大小写，故大小写不同但域/路径相同会覆盖，
+// 只有大小写不同且域或路径不同的项才可能同时出现在头里并被分到不同名称组）
+const naCase = runSimLC([
+  { seconds: 0, url: 'https://example.com/', method: 'GET', setCookies: [
+    'sid=a; Path=/', 'SID=A; Domain=example.com; Path=/admin', 'sid=b; Path=/x'
+  ]},
+  { seconds: 1, url: 'https://example.com/x', method: 'GET', setCookies: [] }
+]).results;
+{
+  // /x 只收到 sid=b 与 sid=a（Path=/admin 不匹配），小写 sid 构成同名分歧组
+  const sidLower = naCase[1].nameReads.find((g) => g.name === 'sid');
+  assert.ok(sidLower, '小写 sid 有两项构成同名组');
+  assert.deepStrictEqual(sidLower.items.map((x) => x.value), ['b', 'a']);
+  assert.strictEqual(sidLower.divergent, true);
+  // 大写 SID 本步头中没有（路径 /admin 不匹配），自然不构成同名组
+  assert.ok(!naCase[1].nameReads.some((g) => g.name === 'SID'));
+  assert.strictEqual(naCase[1].nameReads.length, 1);
+}
+// 请求 /admin 时：收到 SID=A 与 sid=a（不同名称，区分大小写，互不同名）
+const naCase2 = runSimLC([
+  { seconds: 0, url: 'https://example.com/', method: 'GET', setCookies: [
+    'sid=a; Path=/', 'SID=A; Domain=example.com; Path=/admin'
+  ]},
+  { seconds: 1, url: 'https://example.com/admin', method: 'GET', setCookies: [] }
+]).results;
+assert.ok(naCase2[1].cookieHeader.includes('SID=A') && naCase2[1].cookieHeader.includes('sid=a'));
+assert.strictEqual(naCase2[1].nameReads.length, 0, '名称大小写不同不算同名组');
+
+// 场景：无同名 → 明确状态
+const naNone = runSimLC([
+  { seconds: 0, url: 'https://example.com/', method: 'GET', setCookies: ['a=1; Path=/', 'b=2; Path=/'] },
+  { seconds: 1, url: 'https://example.com/', method: 'GET', setCookies: [] }
+]);
+assert.deepStrictEqual(naNone.nameAnalysis.duplicateNames, []);
+assert.deepStrictEqual(naNone.nameAnalysis.divergentNames, []);
+assert.strictEqual(naNone.nameAnalysis.validStepCount, 2);
+assert.strictEqual(naNone.results[1].nameReads.length, 0);
+
+// 场景：跳过步 nameReads = null，且不计入有效请求
+const naSkip = runSimLC([
+  { seconds: 0, url: 'https://example.com/', method: 'GET', setCookies: ['k=1; Path=/', 'k=2; Path=/x'] },
+  { seconds: 1, url: 'bad-url', method: 'GET', setCookies: ['k=9; Path=/'] },
+  { seconds: 1, url: 'https://example.com/x', method: 'GET', setCookies: [] }
+]);
+assert.strictEqual(naSkip.results[1].nameReads, null);
+assert.strictEqual(naSkip.nameAnalysis.validStepCount, 2);
+
+// 场景：过期淘汰在发送阶段发生 → 关联为消失窗口的 at-send 事件
+const naEvict = runSimLC([
+  { seconds: 0, url: 'https://example.com/', method: 'GET', setCookies: [
+    'k=1; Path=/; Max-Age=10', 'k=2; Path=/x; Max-Age=10'
+  ]},
+  { seconds: 1, url: 'https://example.com/x', method: 'GET', setCookies: [] }, // 分歧
+  { seconds: 10, url: 'https://example.com/x', method: 'GET', setCookies: [] }  // 两项均到期
+]);
+const eRun = naEvict.nameAnalysis;
+assert.strictEqual(eRun.divergentNames.length, 1);
+const eDiv = eRun.timeline[0].divergences[0];
+assert.strictEqual(eDiv.toStep, 1);
+assert.strictEqual(eDiv.fallKind, 'disappeared');
+assert.ok(eDiv.fallEvents.length >= 2, '两项淘汰都关联到消失窗口');
+assert.ok(eDiv.fallEvents.every((e) => e.type === 'evicted' && e.phase === 'at-send' && e.step === 2));
+assert.ok(eDiv.fallEvents.every((e) => e.member));
+
+// 场景：分歧持续到最后一个有效请求（ongoing）；末尾步的响应只作“影响后续”提示
+const naOngoing = runSimLC([
+  { seconds: 0, url: 'https://example.com/', method: 'GET', setCookies: ['k=1; Path=/', 'k=2; Path=/x'] },
+  { seconds: 1, url: 'https://example.com/x', method: 'GET', setCookies: ['k=3; Path=/x'] },
+  { seconds: 1, url: 'https://example.com/x', method: 'GET', setCookies: ['k=4; Path=/x'] }
+]);
+const oDiv = naOngoing.nameAnalysis.timeline[0].divergences[0];
+assert.strictEqual(oDiv.fromStep, 1, '第 2 步起分歧（首 2 末 1）');
+assert.strictEqual(oDiv.toStep, 2, '第 3 步仍分歧（首 3 末 1）');
+assert.strictEqual(oDiv.ongoing, true);
+assert.strictEqual(oDiv.fallKind, null);
+// 第 2 步（index 1）的覆盖维持了已存在的分歧：不属于产生窗口（产生窗口只含首分歧步之前的事件）
+assert.deepStrictEqual(oDiv.riseEvents.map((e) => e.step + ':' + e.type), ['0:stored', '0:stored']);
+// 末步（index 2）自身的覆盖列入提示：它不能影响任何已展示的请求
+assert.deepStrictEqual(oDiv.fallEvents.map((e) => e.step + ':' + e.type), ['2:updated']);
+assert.strictEqual(oDiv.fallEvents[0].afterValue, '4');
+
+// 场景：请求作用域变化导致同名组消失（无任何事件）→ fallEvents 为空但仍标 disappeared
+const naScope = runSimLC([
+  { seconds: 0, url: 'https://example.com/', method: 'GET', setCookies: ['k=1; Path=/', 'k=2; Path=/x'] },
+  { seconds: 1, url: 'https://example.com/x', method: 'GET', setCookies: [] }, // 分歧
+  { seconds: 1, url: 'https://example.com/y', method: 'GET', setCookies: [] }  // 路径变化：只剩 / 的 k=1
+]);
+const sDiv = naScope.nameAnalysis.timeline[0].divergences[0];
+assert.strictEqual(sDiv.fallKind, 'disappeared');
+assert.strictEqual(sDiv.fallEvents.length, 0, '无写入/覆盖/删除/淘汰事件，纯作用域变化');
+
 console.log(`全部 ${passed} 条断言通过，另含若干深度比较断言。`);

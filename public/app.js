@@ -126,6 +126,7 @@ document.getElementById('btn-add').addEventListener('click', () => {
 document.getElementById('btn-clear').addEventListener('click', () => {
   steps = [];
   renderSteps();
+  hideNameAnalysisPanel();
   document.getElementById('results').innerHTML =
     '<p class="placeholder">已清空。点击“＋ 新增步骤”或“载入示例”开始。</p>';
 });
@@ -153,6 +154,7 @@ document.getElementById('btn-run').addEventListener('click', runSimulation);
 async function runSimulation() {
   const out = document.getElementById('results');
   out.innerHTML = '<p class="placeholder">运行中…</p>';
+  hideNameAnalysisPanel(); // 同名取值分析随结果整体重算（不影响编辑内容）
   hideLifePanel(); // 结果将整体重算，旧轨迹面板随之关闭（不影响编辑内容）
   hideSolvePanel(); // 求解面板引用的是旧结果，一并关闭（不影响编辑内容）
   let data;
@@ -177,6 +179,7 @@ async function runSimulation() {
     return;
   }
   lastResults = data.results;
+  renderNameAnalysisPanel(data.nameAnalysis, data.results);
   data.results.forEach((r, i) => out.appendChild(renderResult(r, i)));
   // 绑定每个已发送 / 未发送 Cookie 上的“最小复现”按钮
   out.querySelectorAll('.mini-target').forEach((btn) => {
@@ -252,6 +255,9 @@ function renderResult(r, stepIndex) {
     ]));
     body.appendChild(t);
   }
+
+  // 服务端同名取值：严格按实际 Cookie 头顺序、名称区分大小写
+  body.appendChild(renderNameReadsSection(r));
 
   // Set-Cookie 应用
   body.appendChild(el('div', 'section-title', '② 应用 Set-Cookie 响应'));
@@ -343,6 +349,258 @@ function cookieTable(cookies, attrFn, extraFn, extraHeader) {
       if (extraFn) cells.push(extraFn(c, k));
       return cells;
     }));
+}
+
+// ---------- 服务端同名取值 ----------
+
+function domainLabel(item) {
+  return item.hostOnly ? 'host-only: ' + stripDot(item.domain) : 'Domain=' + stripDot(item.domain);
+}
+
+/** 逐步卡片中的“服务端同名取值”小节（按实际头顺序、名称区分大小写）。 */
+function renderNameReadsSection(r) {
+  const wrap = el('div', 'name-reads');
+  wrap.appendChild(el('div', 'section-title', '服务端同名取值（按实际 Cookie 头顺序，名称区分大小写）'));
+
+  if (!r.request) {
+    wrap.appendChild(el('p', 'jarline muted', '本步骤被跳过（URL 非法），没有发送请求，无同名取值分析。'));
+    return wrap;
+  }
+  if (!r.cookieHeader) {
+    wrap.appendChild(el('p', 'jarline muted', 'Cookie 头为空：没有任何已发送 Cookie，不存在同名项。'));
+    return wrap;
+  }
+  if (!r.nameReads || !r.nameReads.length) {
+    wrap.appendChild(el('p', 'jarline muted', '本请求头中没有同名（区分大小写）的 Cookie，服务端取首项 / 取末项无区别。'));
+    return wrap;
+  }
+
+  r.nameReads.forEach((g) => {
+    const box = el('div', 'read-group' + (g.divergent ? ' divergent' : ''));
+
+    const head = el('div', 'read-group-head');
+    head.appendChild(el('span', 'read-name mono', g.name));
+    head.appendChild(el('span', 'badge attr', '同名 ' + g.items.length + ' 项'));
+    head.appendChild(el('span', 'badge ' + (g.divergent ? 'dead' : 'alive'),
+      g.divergent ? '⚠ 首项 ≠ 末项：服务端取值存在分歧' : '首项 = 末项：取值一致'));
+    box.appendChild(head);
+
+    const reads = el('div', 'read-values');
+    reads.innerHTML =
+      '<span class="read-pick">取首项读到：<code class="mono">' + esc(g.name) + '=' + esc(g.firstValue) + '</code></span>' +
+      '<span class="read-pick">取末项读到：<code class="mono">' + esc(g.name) + '=' + esc(g.lastValue) + '</code></span>';
+    box.appendChild(reads);
+
+    const rows = g.items.map((it, k) => [
+      '<span class="mono">' + esc(it.name) + '=' + esc(it.value) + '</span>' +
+        '<div class="jarline muted">头中第 ' + (k + 1) + ' 项（头顺序位置 ' + (it.headerIndex + 1) + '）</div>',
+      '<span class="badge attr">' + esc(domainLabel(it)) + '</span>' +
+        '<span class="badge attr">Path=' + esc(it.path) + '</span>',
+      '<span class="jarline">创建次序 #' + esc(it.creationOrder + 1) + '</span>'
+    ]);
+    box.appendChild(tableWith(['头中逐项的值', '域 / 路径', '创建次序'], rows));
+    wrap.appendChild(box);
+  });
+  return wrap;
+}
+
+// ---------- 同名取值分歧时间线（全局面板） ----------
+
+function nameAnalysisPanel() {
+  return document.getElementById('name-analysis-panel');
+}
+
+function hideNameAnalysisPanel() {
+  const panel = nameAnalysisPanel();
+  if (!panel) return;
+  panel.className = 'hidden';
+  panel.innerHTML = '';
+}
+
+function renderNameAnalysisPanel(analysis, results) {
+  const panel = nameAnalysisPanel();
+  panel.innerHTML = '';
+  panel.className = 'name-analysis-panel';
+
+  const head = el('div', 'na-head');
+  head.appendChild(el('div', 'section-title', '🔀 服务端同名取值分析（时间线）'));
+  panel.appendChild(head);
+  panel.appendChild(el('p', 'na-stats',
+    '名称按区分大小写匹配；同名组沿有效请求时间线追踪。每一步先发送后处理响应：某步响应只能影响后续请求，' +
+    '过期淘汰发生在该步发送决策阶段。下表每个单元格代表一个有效请求：'));
+
+  if (!analysis || !analysis.validStepCount) {
+    panel.appendChild(el('p', 'placeholder', '没有有效请求（URL 合法且为 http/https），暂无可分析的 Cookie 头。'));
+    return;
+  }
+  if (!analysis.duplicateNames.length) {
+    panel.appendChild(el('p', 'placeholder',
+      '全部 ' + analysis.validStepCount + ' 个有效请求的 Cookie 头中均未出现同名（区分大小写）的 Cookie，没有同名取值。'));
+    return;
+  }
+
+  // 图例
+  const legend = el('div', 'na-legend');
+  legend.innerHTML =
+    '<span class="na-cell absent"><i></i>无同名组</span>' +
+    '<span class="na-cell same"><i></i>同名但取值一致</span>' +
+    '<span class="na-cell divergent"><i></i>首末取值分歧</span>';
+  panel.appendChild(legend);
+
+  analysis.timeline.forEach((t) => {
+    panel.appendChild(renderNameTimelineCard(t, results));
+  });
+
+  if (!analysis.divergentNames.length) {
+    panel.appendChild(el('p', 'placeholder na-summary',
+      '共出现 ' + analysis.duplicateNames.length + ' 个同名名称，但所有同名组的首项与末项取值始终一致，从未产生分歧。'));
+  } else {
+    panel.appendChild(el('p', 'jarline na-summary',
+      '共 ' + analysis.duplicateNames.length + ' 个同名名称，其中 ' + analysis.divergentNames.length +
+      ' 个出现过首末取值分歧（红色单元格）。'));
+  }
+}
+
+function stateCellClass(state) {
+  return state === 'divergent' ? 'divergent' : state === 'same' ? 'same' : 'absent';
+}
+
+function stateSymbol(state) {
+  return state === 'divergent' ? '⚠' : state === 'same' ? '=' : '·';
+}
+
+function stateTitle(name, state) {
+  return state === 'divergent' ? `名称 ${name}：该请求同名项首末取值分歧`
+    : state === 'same' ? `名称 ${name}：该请求有同名项但取值一致`
+    : `名称 ${name}：该请求没有同名组`;
+}
+
+function renderNameTimelineCard(t, results) {
+  const card = el('div', 'na-card' + (t.divergences.length ? ' has-div' : ''));
+
+  const title = el('div', 'na-card-title');
+  title.innerHTML = '名称 <span class="mono">' + esc(t.name) + '</span>' +
+    (t.divergences.length
+      ? ' <span class="badge dead">' + t.divergences.length + ' 段分歧</span>'
+      : ' <span class="badge alive">从未分歧</span>');
+  card.appendChild(title);
+
+  // 时间线单元格（仅有效请求）
+  const strip = el('div', 'na-strip');
+  t.states.forEach(({ step, state }) => {
+    const cell = el('button', 'na-cell ' + stateCellClass(state), stateSymbol(state));
+    cell.type = 'button';
+    cell.title = '第 ' + (step + 1) + ' 步 · ' + stateTitle(t.name, state);
+    cell.addEventListener('click', () => jumpToStep(step));
+    const num = el('span', 'na-cell-step', String(step + 1));
+    cell.appendChild(num);
+    strip.appendChild(cell);
+  });
+  card.appendChild(strip);
+
+  // 每段分歧的产生 / 消失与事件关联
+  t.divergences.forEach((d) => card.appendChild(renderDivergenceCard(t.name, d, results)));
+  return card;
+}
+
+const NAME_EVENT_TEXT = {
+  stored: '写入',
+  updated: '覆盖',
+  deleted: '删除',
+  evicted: '过期淘汰'
+};
+
+const RISE_KIND_TEXT = {
+  'appeared-divergent': '该名称此前没有同名组，本步头中首次出现同名即首末取值分歧（由上一有效请求之后的写入 / 覆盖造成）',
+  'became-divergent': '该名称此前已有同名组且取值一致，本步起首末取值出现分歧'
+};
+
+const FALL_KIND_TEXT = {
+  resolved: '分歧在下一步消失：仍存在同名组，但首末取值已一致（被覆盖为同值或项数变化）',
+  disappeared: '分歧在下一步消失：该名称在下一有效请求中不再构成同名组（删除、过期淘汰或请求作用域变化）'
+};
+
+function nameEventRow(ev) {
+  const target = ev.domain + ' ' + ev.path;
+  const phase = ev.phase === 'at-send' ? '发送阶段淘汰' : '响应处理';
+  const valueChange = ev.type === 'stored'
+    ? '写入值 <span class="mono">' + esc(ev.afterValue) + '</span>'
+    : ev.type === 'updated'
+      ? '<span class="mono">' + esc(ev.beforeValue) + '</span> → <span class="mono">' + esc(ev.afterValue) + '</span>'
+      : ev.type === 'deleted'
+        ? (ev.beforeValue != null
+          ? '删除前值 <span class="mono">' + esc(ev.beforeValue) + '</span>'
+          : '<span class="na">空操作：未命中任何项</span>')
+        : '淘汰前值 <span class="mono">' + esc(ev.beforeValue) + '</span>';
+  return '<div class="na-event ' + esc(ev.type) + '">' +
+    '<button type="button" class="life-jump na-jump" data-jump="' + ev.step + '">↩ 第 ' + (ev.step + 1) + ' 步</button>' +
+    '<span class="badge ' + esc(ev.type) + '">' + esc(NAME_EVENT_TEXT[ev.type] || ev.type) + '</span>' +
+    '<span class="badge attr">' + esc(phase) + '</span>' +
+    (ev.member ? '<span class="badge alive">本组项</span>' : '<span class="badge miss">同名其他域/路径</span>') +
+    '<span class="na-event-target mono">' + esc(target) + '</span>' +
+    (ev.raw
+      ? '<span class="na-event-raw mono">' + esc(ev.raw) + '</span>'
+      : '<span class="na-event-raw na">（引擎内部事件，无对应 Set-Cookie）</span>') +
+    '<span class="na-event-values jarline">' + valueChange + '</span>' +
+    '</div>';
+}
+
+function bindNaJumps(scope) {
+  scope.querySelectorAll('.na-jump').forEach((btn) => {
+    btn.addEventListener('click', () => jumpToStep(Number(btn.dataset.jump)));
+  });
+}
+
+function renderDivergenceCard(name, d, results) {
+  const box = el('div', 'na-divergence');
+
+  const range = el('div', 'na-div-range');
+  range.innerHTML =
+    (d.toStep === d.fromStep
+      ? '第 <b>' + (d.fromStep + 1) + '</b> 步'
+      : '第 <b>' + (d.fromStep + 1) + '</b> 步 → 第 <b>' + (d.toStep + 1) + '</b> 步') +
+    ' <span class="jarline muted">(' + esc(d.fromClockISO) + ' 起' +
+    (d.toStep === d.fromStep ? '' : '，至 ' + esc(d.toClockISO)) + ')</span>' +
+    ' · 首项 <span class="mono">' + esc(name) + '=' + esc(d.firstValue) + '</span>' +
+    ' / 末项 <span class="mono">' + esc(name) + '=' + esc(d.lastValue) + '</span>';
+  box.appendChild(range);
+
+  // 产生
+  box.appendChild(el('div', 'na-phase-title', '分歧何时产生：' + esc(RISE_KIND_TEXT[d.riseKind] || d.riseKind)));
+  if (d.riseEvents.length) {
+    const list = el('div', 'na-event-list');
+    list.innerHTML = d.riseEvents.map(nameEventRow).join('');
+    box.appendChild(list);
+  } else {
+    box.appendChild(el('p', 'jarline muted na-noevent',
+      '相邻步骤之间没有命中该名称的写入 / 覆盖 / 删除 / 过期淘汰事件；该分歧仅由请求作用域变化（域 / 路径 / Secure / SameSite 决定哪些项进入头）产生。'));
+  }
+
+  // 消失
+  if (d.ongoing) {
+    box.appendChild(el('div', 'na-phase-title', '何时消失：分歧持续到最后一个有效请求，之后没有更多请求可观察。'));
+    if (d.fallEvents.length) {
+      box.appendChild(el('p', 'jarline muted', '最后一步的响应（先发送后处理）只能影响后续请求，时间线中已无后续请求：'));
+      const list = el('div', 'na-event-list');
+      list.innerHTML = d.fallEvents.map(nameEventRow).join('');
+      box.appendChild(list);
+    } else {
+      box.appendChild(el('p', 'jarline muted na-noevent', '末尾步也没有命中该名称的响应事件。'));
+    }
+  } else {
+    box.appendChild(el('div', 'na-phase-title', '分歧何时消失：' + esc(FALL_KIND_TEXT[d.fallKind] || d.fallKind)));
+    if (d.fallEvents.length) {
+      const list = el('div', 'na-event-list');
+      list.innerHTML = d.fallEvents.map(nameEventRow).join('');
+      box.appendChild(list);
+    } else {
+      box.appendChild(el('p', 'jarline muted na-noevent',
+        '相邻步骤之间没有命中该名称的写入 / 覆盖 / 删除 / 过期淘汰事件；该变化仅由请求作用域（域 / 路径 / Secure / SameSite）改变造成。'));
+    }
+  }
+
+  bindNaJumps(box);
+  return box;
 }
 
 // ---------- 最小复现 ----------
