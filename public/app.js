@@ -177,6 +177,8 @@ async function runSimulation() {
     return;
   }
   lastResults = data.results;
+  // 服务端同名取值 · 分歧时间线汇总（沿有效请求；每次运行随结果整体刷新，不改编辑内容）
+  out.appendChild(renderServerViewSummary(data.results));
   data.results.forEach((r, i) => out.appendChild(renderResult(r, i)));
   // 绑定每个已发送 / 未发送 Cookie 上的“最小复现”按钮
   out.querySelectorAll('.mini-target').forEach((btn) => {
@@ -251,6 +253,12 @@ function renderResult(r, stepIndex) {
       targetButtons(stepIndex, 'unsent', k)
     ]));
     body.appendChild(t);
+  }
+
+  // 服务端同名取值（仅有效请求；基于本步发送的 Cookie 头 —— 先发送，② 的响应只影响后续请求）
+  if (r.request) {
+    body.appendChild(el('div', 'section-title', '服务端同名取值（本请求 Cookie 头 · 名称区分大小写）'));
+    body.appendChild(renderServerViewRequest(window.ServerView.analyzeRequest(r)));
   }
 
   // Set-Cookie 应用
@@ -555,6 +563,172 @@ function jumpToStep(stepIndex) {
   // 强制重排以重新触发动画
   void node.offsetWidth;
   node.classList.add('flash');
+}
+
+// ---------- 服务端同名取值 ----------
+
+const SV_VANISH_TEXT = {
+  absent: '该名称不再出现在 Cookie 头中',
+  single: '同名并列消失，仅剩 1 项',
+  'multi-agree': '同名项仍并列，但首末取值转为一致'
+};
+
+function svValue(v) {
+  return v === '' || v == null ? '(空值)' : String(v);
+}
+
+/** 逐请求分析：按实际头顺序、名称区分大小写，给出取首项 / 取末项两种口径的读值。 */
+function renderServerViewRequest(a) {
+  const wrap = el('div', 'sv-request');
+  if (a.empty) {
+    wrap.appendChild(el('p', 'jarline', 'Cookie 头为空：服务端读不到任何 Cookie，无同名取值问题。'));
+    return wrap;
+  }
+  const rows = a.groups.map((g) => {
+    const lastCell = '<span class="mono">' + esc(svValue(g.last)) + '</span>' +
+      (g.multi
+        ? (g.divergent ? ' <span class="badge deleted">分歧</span>' : ' <span class="badge attr">首末一致</span>')
+        : '');
+    const detail = g.items.map((it, k) =>
+      '<div class="jarline">#' + (k + 1) + ' <span class="mono">' + esc(svValue(it.value)) + '</span> ' +
+      '<span class="badge attr">' + (it.hostOnly ? 'host-only' : 'Domain=' + esc(stripDot(it.domain))) + '</span>' +
+      '<span class="badge attr">Path=' + esc(it.path) + '</span>' +
+      '<span class="badge attr">创建次序 #' + esc(it.creationOrder == null ? '?' : it.creationOrder) + '</span></div>'
+    ).join('');
+    return [
+      '<span class="mono">' + esc(g.name) + '</span>' +
+        (g.multi ? '<div class="jarline">同名 ' + g.items.length + ' 项</div>' : ''),
+      '<span class="mono">' + esc(svValue(g.first)) + '</span>',
+      lastCell,
+      detail
+    ];
+  });
+  wrap.appendChild(tableWith(
+    ['名称（区分大小写）', '取首项读到', '取末项读到', '同名组明细（头中顺序 · 值 / 域 / 路径 / 创建次序）'], rows));
+  if (a.divergentNames.length) {
+    wrap.appendChild(el('p', 'jarline sv-note',
+      '⚠ ' + a.divergentNames.map((n) => '<span class="mono">' + esc(n) + '</span>').join('、') +
+      ' 的“取首项”与“取末项”读到的值不同：服务端框架解析口径不同会得到不同结果。'));
+  } else {
+    wrap.appendChild(el('p', 'jarline sv-note', '本请求无同名取值分歧（各名称取首项与取末项一致）。'));
+  }
+  return wrap;
+}
+
+/** 关联事件的一行简介（写入 / 覆盖 / 删除 / 过期淘汰，含键与值变化）。 */
+function svEventBrief(ev) {
+  const key = '<span class="mono">' + esc(ev.name) + ' @ ' + esc(stripDot(ev.domain)) + ' ' + esc(ev.path) + '</span>';
+  switch (ev.type) {
+    case 'stored':
+      return '<span class="badge stored">写入</span> ' + key +
+        ' 值 <span class="mono">' + esc(svValue(ev.after && ev.after.value)) + '</span>';
+    case 'updated':
+      return '<span class="badge updated">覆盖</span> ' + key +
+        ' 值 <span class="mono">' + esc(svValue(ev.before && ev.before.value)) +
+        ' → ' + esc(svValue(ev.after && ev.after.value)) + '</span>';
+    case 'deleted':
+      return '<span class="badge deleted">删除</span> ' + key +
+        (ev.before
+          ? '（命中，原值 <span class="mono">' + esc(svValue(ev.before.value)) + '</span>）'
+          : '（空操作，未命中任何项）');
+    case 'evicted':
+      return '<span class="badge evicted">过期淘汰</span> ' + key +
+        (ev.before ? '（原值 <span class="mono">' + esc(svValue(ev.before.value)) + '</span>）' : '');
+    default:
+      return esc(ev.type) + ' ' + key;
+  }
+}
+
+function renderSvTransition(t) {
+  const item = el('div', 'sv-transition ' + t.type);
+
+  const top = el('div', 'sv-transition-top');
+  const jump = el('button', 'life-jump', '↩ 第 ' + (t.step + 1) + ' 步');
+  jump.type = 'button';
+  jump.title = '跳转到该有效请求所在步骤';
+  jump.addEventListener('click', () => jumpToStep(t.step));
+  top.appendChild(jump);
+  top.appendChild(el('span', 'life-clock', '⏱ ' + t.clockISO));
+  top.appendChild(el('span', 'badge ' + (t.type === 'arise' ? 'deleted' : 'alive'),
+    t.type === 'arise' ? '分歧产生' : '分歧消失'));
+  item.appendChild(top);
+
+  const row = el('div', 'life-row');
+  if (t.type === 'arise') {
+    row.appendChild(el('span', 'life-k', '两种取值'));
+    row.appendChild(el('span', 'life-v',
+      '取首项 = <span class="mono">' + esc(svValue(t.first)) + '</span>；' +
+      '取末项 = <span class="mono">' + esc(svValue(t.last)) + '</span>'));
+  } else {
+    row.appendChild(el('span', 'life-k', '消失原因'));
+    row.appendChild(el('span', 'life-v', esc(SV_VANISH_TEXT[t.state] || t.state)));
+  }
+  item.appendChild(row);
+
+  const evRow = el('div', 'life-row');
+  evRow.appendChild(el('span', 'life-k', '关联事件'));
+  evRow.appendChild(el('span', 'life-v', t.events.length
+    ? t.events.map((ev) => '<div class="jarline">第 ' + (ev.step + 1) + ' 步 · ' + svEventBrief(ev) + '</div>').join('')
+    : '<span class="na">（相邻步骤无该名称的写入 / 覆盖 / 删除 / 过期淘汰事件）</span>'));
+  item.appendChild(evRow);
+
+  return item;
+}
+
+/** 时间线汇总：每个名称的分歧何时产生、何时消失，以及相邻步骤的关联 Jar 事件。 */
+function renderServerViewSummary(results) {
+  const tl = window.ServerView.analyzeTimeline(results);
+  const card = el('div', 'result-card serverview-card');
+  const body = el('div', 'result-body');
+  body.appendChild(el('div', 'section-title', '🔀 服务端同名取值 · 分歧时间线（沿有效请求）'));
+
+  if (!tl.validCount) {
+    body.appendChild(el('p', 'placeholder', '没有有效请求（所有步骤均被跳过）：无服务端取值可分析。'));
+    card.appendChild(body);
+    return card;
+  }
+
+  const diverging = tl.names.filter((n) => n.everDivergent);
+  const multiOnly = tl.names.filter((n) => !n.everDivergent && n.everMulti);
+  const singleOnly = tl.names.filter((n) => !n.everDivergent && !n.everMulti);
+  const emptyCount = tl.validSteps.filter((s) => tl.perStep.get(s).empty).length;
+
+  const stats = ['有效请求 ' + tl.validCount + ' 个'];
+  if (emptyCount === tl.validCount) stats.push('全部请求的 Cookie 头为空，服务端读不到任何 Cookie');
+  else if (emptyCount > 0) stats.push(emptyCount + ' 个请求的 Cookie 头为空');
+  stats.push(diverging.length
+    ? '出现过“取首项 ≠ 取末项”分歧的名称 ' + diverging.length + ' 个：' + diverging.map((n) => n.name).join('、')
+    : '未出现同名取值分歧');
+  body.appendChild(el('p', 'sv-stats', esc(stats.join('；') + '。')));
+  body.appendChild(el('p', 'sv-stats',
+    '分组与取值按头中原文（名称区分大小写）；关联事件按 Jar 键名称（不区分大小写）匹配相邻步骤的' +
+    '写入 / 覆盖 / 删除 / 过期淘汰。同一步先发送后处理响应：本步响应只影响后续请求，不计入本步取值的关联事件。'));
+
+  diverging.forEach((rec) => {
+    const block = el('div', 'sv-name');
+    block.appendChild(el('div', 'sv-name-head',
+      '<span class="mono">' + esc(rec.name) + '</span>' +
+      (rec.divergentNow
+        ? ' <span class="badge deleted">截至最后一个有效请求仍分歧</span>'
+        : ' <span class="badge alive">当前无分歧</span>')));
+    const list = el('div', 'sv-transitions');
+    rec.transitions.forEach((t) => list.appendChild(renderSvTransition(t)));
+    block.appendChild(list);
+    body.appendChild(block);
+  });
+
+  multiOnly.forEach((rec) => {
+    body.appendChild(el('p', 'jarline',
+      '名称 <span class="mono">' + esc(rec.name) + '</span>：同名并列出现过，但首末取值始终一致，无分歧。'));
+  });
+  if (singleOnly.length) {
+    body.appendChild(el('p', 'jarline',
+      '以下名称从未出现同名并列（取首项与取末项始终一致）：' +
+      singleOnly.map((n) => '<span class="mono">' + esc(n.name) + '</span>').join('、')));
+  }
+
+  card.appendChild(body);
+  return card;
 }
 
 // ---------- 最小复现（续） ----------

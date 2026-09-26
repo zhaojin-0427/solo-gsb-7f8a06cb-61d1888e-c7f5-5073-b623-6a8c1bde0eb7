@@ -739,4 +739,141 @@ const lcSkip = runSimLC([
 assert.deepStrictEqual(lcSkip[0].events, []);
 assert.strictEqual(lcSkip[1].clock, lcSkip[0].clock + 1000);
 
+// --- 服务端同名取值分析（ServerView）---
+
+const ServerView = require('../public/serverview');
+
+// 场景：同名不同路径并列 → 取首项 ≠ 取末项；删除后分歧消失；同一步响应只影响后续请求
+const stepsSV = [
+  { seconds: 0, url: 'https://shop.example.com/', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: [
+      'k=root; Path=/',
+      'k=api; Path=/api; Max-Age=10',
+      'SID=upper; Path=/',
+      'sid=lower; Path=/api'
+    ] },
+  { seconds: 1, url: 'https://shop.example.com/api/x', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] },
+  { seconds: 1, url: 'https://shop.example.com/api/x', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['k=; Path=/api; Max-Age=0'] }, // 删除在本步发送之后处理，只影响后续请求
+  { seconds: 1, url: 'https://shop.example.com/api/x', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['k=again; Path=/api'] }, // 本步发送时 k 仍单项；响应写入使后续请求再次分歧
+  { seconds: 1, url: 'https://shop.example.com/api/x', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] }
+];
+const svRes = runSimulation(stepsSV).results;
+
+// 逐请求分析：空头给出明确状态
+const sv0 = ServerView.analyzeRequest(svRes[0]);
+ok(sv0.empty === true && sv0.groups.length === 0 && sv0.divergentNames.length === 0, '空头状态明确');
+
+// 第 2 步：头顺序 = 路径更长者优先、其次创建更早者优先
+assert.strictEqual(svRes[1].cookieHeader, 'k=api; sid=lower; k=root; SID=upper');
+const sv1 = ServerView.analyzeRequest(svRes[1]);
+assert.strictEqual(sv1.empty, false);
+// 名称区分大小写：sid 与 SID 各自成组
+assert.deepStrictEqual(sv1.groups.map((g) => g.name), ['k', 'sid', 'SID']);
+const gK = sv1.groups[0];
+assert.strictEqual(gK.multi, true);
+assert.strictEqual(gK.first, 'api', '取首项 = 头中第一项的值');
+assert.strictEqual(gK.last, 'root', '取末项 = 头中末项的值');
+ok(gK.divergent, '两种取值不同 → 标出分歧');
+// 同名组逐项：头中顺序 + 域 / 路径 / 创建次序
+assert.deepStrictEqual(gK.items.map((x) => x.value), ['api', 'root']);
+assert.strictEqual(gK.items[0].path, '/api');
+assert.strictEqual(gK.items[1].path, '/');
+assert.strictEqual(gK.items[0].creationOrder, 1);
+assert.strictEqual(gK.items[1].creationOrder, 0);
+ok(gK.items.every((x) => x.hostOnly && x.domain === 'shop.example.com'), '每项携带域信息');
+// 单一项名称：首末一致、不标分歧
+const gSid = sv1.groups.find((g) => g.name === 'sid');
+ok(gSid && !gSid.multi && !gSid.divergent && gSid.first === 'lower' && gSid.last === 'lower');
+assert.deepStrictEqual(sv1.divergentNames, ['k']);
+
+// 时间线：分歧产生 / 消失 / 再产生，事件按 Jar 键名称关联
+const svTl = ServerView.analyzeTimeline(svRes);
+assert.strictEqual(svTl.validCount, 5);
+const recK = svTl.names.find((n) => n.name === 'k');
+assert.deepStrictEqual(recK.transitions.map((t) => t.type + '@' + t.step),
+  ['arise@1', 'vanish@3', 'arise@4'], '分歧何时产生、何时消失沿有效请求标出');
+// 产生：关联相邻步骤（第 1 步响应）的两条 k 写入
+const arise1 = recK.transitions[0];
+assert.strictEqual(arise1.first, 'api');
+assert.strictEqual(arise1.last, 'root');
+assert.deepStrictEqual(arise1.events.map((e) => e.type + '@' + e.step), ['stored@0', 'stored@0']);
+// 消失：仅剩一项；关联上一步响应的删除；本步（index 3）响应的写入不计入本步
+const vanish3 = recK.transitions[1];
+assert.strictEqual(vanish3.state, 'single');
+assert.deepStrictEqual(vanish3.events.map((e) => e.type + '@' + e.step), ['deleted@2'],
+  '同一步先发送后处理响应：本步响应事件不影响本步取值');
+// 再产生：关联上一步响应的写入
+const arise4 = recK.transitions[2];
+assert.strictEqual(arise4.first, 'again');
+assert.strictEqual(arise4.last, 'root');
+assert.deepStrictEqual(arise4.events.map((e) => e.type + '@' + e.step), ['stored@3']);
+ok(recK.everDivergent && recK.divergentNow, '截至末步仍分歧');
+// SID / sid 全程单项：无分歧、无同名并列
+for (const nm of ['SID', 'sid']) {
+  const rec = svTl.names.find((n) => n.name === nm);
+  ok(rec && !rec.everDivergent && !rec.everMulti && rec.transitions.length === 0,
+    nm + ' 全程单项发送');
+}
+
+// 过期淘汰关联：同名两项之一过期 → 分歧在到期后的首个有效请求消失，关联淘汰事件
+const sv2 = runSimulation([
+  { seconds: 0, url: 'https://e.example/', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['d=long; Path=/', 'd=short; Path=/p; Max-Age=5'] },
+  { seconds: 1, url: 'https://e.example/p/x', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] },
+  { seconds: 5, url: 'https://e.example/p/x', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] }
+]).results;
+const tl2 = ServerView.analyzeTimeline(sv2);
+const recD = tl2.names.find((n) => n.name === 'd');
+assert.deepStrictEqual(recD.transitions.map((t) => t.type + '@' + t.step), ['arise@1', 'vanish@2']);
+const vanD = recD.transitions[1];
+assert.strictEqual(vanD.state, 'single');
+assert.deepStrictEqual(vanD.events.map((e) => e.type + '@' + e.step), ['evicted@2'],
+  '过期淘汰发生在发送判定中，关联到分歧消失');
+
+// 同名同值：首末一致，不标分歧（但记为同名并列出现过）
+const sv3 = runSimulation([
+  { seconds: 0, url: 'https://m.example/', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['s=1; Path=/', 's=1; Path=/p'] },
+  { seconds: 1, url: 'https://m.example/p', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] }
+]).results;
+const gS = ServerView.analyzeRequest(sv3[1]).groups.find((g) => g.name === 's');
+ok(gS.multi && !gS.divergent && gS.first === '1' && gS.last === '1', '同名同值：首末一致');
+const recS = ServerView.analyzeTimeline(sv3).names.find((n) => n.name === 's');
+ok(recS.everMulti && !recS.everDivergent && recS.transitions.length === 0, '同名同值不产生分歧事件');
+
+// 分歧后该名称完全不再发送 → 分歧消失（absent），且相邻步骤可无关联事件
+const sv5 = runSimulation([
+  { seconds: 0, url: 'https://a.example/', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['z=1; Path=/', 'z=2; Path=/p'] },
+  { seconds: 1, url: 'https://a.example/p', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] },
+  { seconds: 1, url: 'https://other.example/', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] }
+]).results;
+const recZ = ServerView.analyzeTimeline(sv5).names.find((n) => n.name === 'z');
+assert.deepStrictEqual(recZ.transitions.map((t) => t.type + '@' + t.step), ['arise@1', 'vanish@2']);
+assert.strictEqual(recZ.transitions[1].state, 'absent', '名称不再发送 → 分歧消失');
+assert.deepStrictEqual(recZ.transitions[1].events, [], '相邻步骤无该名称事件时关联为空');
+
+// 事件关联按 Jar 键口径（名称不区分大小写）：小写删除事件关联到大写名称的时间线
+const sv8 = runSimulation([
+  { seconds: 0, url: 'https://c.example/', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['K=one; Path=/', 'K=two; Path=/p'] },
+  { seconds: 1, url: 'https://c.example/p', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] },
+  { seconds: 1, url: 'https://c.example/p', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['k=; Path=/p; Max-Age=0'] }, // Jar 键名称不区分大小写：删除命中 K@/p
+  { seconds: 1, url: 'https://c.example/p', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] }
+]).results;
+const recK8 = ServerView.analyzeTimeline(sv8).names.find((n) => n.name === 'K');
+assert.deepStrictEqual(recK8.transitions.map((t) => t.type + '@' + t.step), ['arise@1', 'vanish@3']);
+assert.deepStrictEqual(recK8.transitions[1].events.map((e) => e.type + '@' + e.step), ['deleted@2'],
+  '删除事件名称为小写 k，仍按 Jar 键口径关联到大写 K 的时间线');
+
+// 非法 URL 步骤不算有效请求；没有有效请求时时间线为空
+const tl6 = ServerView.analyzeTimeline(runSimulation([
+  { seconds: 3, url: 'not-a-url', method: 'GET', topUrl: '', isNavigation: false, setCookies: ['x=1'] }
+]).results);
+assert.strictEqual(tl6.validCount, 0, '非法 URL 步骤不算有效请求');
+assert.strictEqual(tl6.names.length, 0);
+
 console.log(`全部 ${passed} 条断言通过，另含若干深度比较断言。`);
